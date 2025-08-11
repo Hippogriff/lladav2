@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.functional import scaled_dot_product_attention
 from torch.utils.data import DataLoader, TensorDataset
 from pathlib import Path
 import time
@@ -34,13 +35,15 @@ class SimpleTransformerEncoder(nn.Module):
     In practice, you would use a more sophisticated architecture.
     """
     
-    def __init__(self, vocab_size: int, d_model: int = 512, n_heads: int = 8, 
-                 n_layers: int = 6, max_seq_len: int = 4096):
+    def __init__(self, vocab_size: int, d_model: int = 768, n_heads: int = 12, 
+                 n_layers: int = 24, max_seq_len: int = 4096, dropout: float = 0.1):
         super().__init__()
         
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
+        self.n_heads = n_heads
+        self.n_layers = n_layers
         
         # Token embedding
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -48,21 +51,97 @@ class SimpleTransformerEncoder(nn.Module):
         # Positional encoding
         self.pos_encoding = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
         
-        # Transformer encoder layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_model * 4,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        # Layer normalization for embeddings
+        self.embed_norm = nn.LayerNorm(d_model)
+        
+        # Dropout after embeddings
+        self.embed_dropout = nn.Dropout(dropout)
+        
+        # Create transformer layers
+        self.layers = nn.ModuleList([
+            TransformerLayer(d_model, n_heads, dropout) 
+            for _ in range(n_layers)
+        ])
+        
+        # Final layer normalization
+        self.final_norm = nn.LayerNorm(d_model)
         
         # Output projection
         self.output_projection = nn.Linear(d_model, vocab_size)
         
         # Initialize weights
         self.apply(self._init_weights)
+        
+        # Print model info
+        print(f"Created Transformer with {n_layers} layers, {d_model} dimensions, {n_heads} heads")
+        print(f"Total parameters: {sum(p.numel() for p in self.parameters()):,}")
+
+
+class TransformerLayer(nn.Module):
+    """Custom transformer layer using scaled_dot_product_attention without causal masking."""
+    
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        
+        # Multi-head attention projections
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        # Layer normalization
+        self.attn_norm = nn.LayerNorm(d_model)
+        self.ffn_norm = nn.LayerNorm(d_model)
+        
+        # Feed-forward network
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout)
+        )
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        # x: (batch_size, seq_len, d_model)
+        batch_size, seq_len, _ = x.shape
+        
+        # Multi-head attention
+        residual = x
+        x = self.attn_norm(x)
+        
+        # Project to Q, K, V
+        q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        # Use scaled_dot_product_attention without causal masking
+        attn_output = scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout.p if self.training else 0.0)
+        
+        # Reshape and project output
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        attn_output = self.o_proj(attn_output)
+        attn_output = self.dropout(attn_output)
+        
+        # Add residual connection
+        x = residual + attn_output
+        
+        # Feed-forward network
+        residual = x
+        x = self.ffn_norm(x)
+        x = self.ffn(x)
+        
+        # Add residual connection
+        x = residual + x
+        
+        return x
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -82,8 +161,16 @@ class SimpleTransformerEncoder(nn.Module):
         # Add positional encoding
         x = x + self.pos_encoding[:, :seq_len, :]
         
-        # Pass through transformer
-        x = self.transformer(x)
+        # Apply embedding normalization and dropout
+        x = self.embed_norm(x)
+        x = self.embed_dropout(x)
+        
+        # Pass through transformer layers
+        for layer in self.layers:
+            x = layer(x)
+        
+        # Apply final layer normalization
+        x = self.final_norm(x)
         
         # Project to vocabulary
         logits = self.output_projection(x)  # (batch_size, seq_len, vocab_size)
@@ -333,14 +420,16 @@ def main():
                        help="Training batch size")
     parser.add_argument("--epochs", type=int, default=10,
                        help="Number of training epochs")
-    parser.add_argument("--d_model", type=int, default=512,
-                       help="Model dimension")
-    parser.add_argument("--n_heads", type=int, default=8,
-                       help="Number of attention heads")
-    parser.add_argument("--n_layers", type=int, default=6,
-                       help="Number of transformer layers")
+    parser.add_argument("--d_model", type=int, default=768,
+                       help="Model dimension (default: 768)")
+    parser.add_argument("--n_heads", type=int, default=12,
+                       help="Number of attention heads (default: 12)")
+    parser.add_argument("--n_layers", type=int, default=24,
+                       help="Number of transformer layers (default: 24)")
+    parser.add_argument("--dropout", type=float, default=0.1,
+                       help="Dropout rate (default: 0.1)")
     parser.add_argument("--learning_rate", type=float, default=1e-4,
-                       help="Learning rate")
+                       help="Learning rate (default: 1e-4)")
     parser.add_argument("--device", type=str, default="auto",
                        help="Device to use (auto, cpu, cuda)")
     
@@ -366,7 +455,8 @@ def main():
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
-        max_seq_len=metadata['sequence_length']
+        max_seq_len=metadata['sequence_length'],
+        dropout=args.dropout
     )
     
     # Create trainer

@@ -10,6 +10,7 @@ The scripts implement the LLaDA training process as described in the [GUIDELINES
 
 - `download_shakespeare_dataset.py` - Downloads and preprocesses the Shakespeare dataset
 - `train_llada_shakespeare.py` - Training script for LLaDA
+- `test_transformer.py` - Test script for the custom transformer implementation
 - `requirements.txt` - Python dependencies
 - `SHAKESPEARE_README.md` - This file
 
@@ -21,7 +22,13 @@ The scripts implement the LLaDA training process as described in the [GUIDELINES
 pip install -r requirements.txt
 ```
 
-### 2. Download and Preprocess Dataset
+### 2. Test Transformer Implementation
+
+```bash
+python test_transformer.py
+```
+
+### 3. Download and Preprocess Dataset
 
 ```bash
 python download_shakespeare_dataset.py --output_dir shakespeare_dataset
@@ -34,7 +41,7 @@ This will:
 - Split data into training (90%) and validation (10%) sets
 - Save processed data in numpy format
 
-### 3. Train LLaDA
+### 4. Train LLaDA
 
 ```bash
 python train_llada_shakespeare.py --data_dir shakespeare_dataset --epochs 10 --batch_size 4
@@ -63,13 +70,29 @@ The training implements the forward process described in GUIDELINES.md:
 
 ## Model Architecture
 
-The training script includes a simple Transformer Encoder implementation:
+The training script includes a custom Transformer Encoder implementation optimized for LLaDA:
 
-- **Embedding Layer**: Token and positional embeddings
-- **Transformer Encoder**: Multi-head self-attention layers
+- **Custom Attention**: Uses `scaled_dot_product_attention` without causal masking
+- **Bidirectional Processing**: Full attention across all positions (non-autoregressive)
+- **Embedding Layer**: Token and positional embeddings with layer normalization
+- **Transformer Encoder**: Multi-head self-attention layers with GELU activation
+- **Layer Normalization**: Applied to embeddings, attention, and final output
+- **Dropout**: Configurable dropout for regularization
 - **Output Projection**: Linear layer to vocabulary size
 
-For production use, you should replace this with a more sophisticated architecture.
+**Default Architecture:**
+- **Layers**: 24 transformer layers
+- **Dimensions**: 768 model dimensions
+- **Heads**: 12 attention heads
+- **Dropout**: 0.1
+
+**Key Features:**
+- **No Causal Masking**: Perfect for LLaDA's diffusion approach
+- **Bidirectional Attention**: Each token can attend to all other tokens
+- **Efficient Implementation**: Uses PyTorch's optimized `scaled_dot_product_attention`
+- **Residual Connections**: Proper skip connections throughout the network
+
+This architecture provides a good balance between model capacity and training efficiency. For production use, you can scale up to match the full LLaDA architecture.
 
 ## Configuration Options
 
@@ -83,9 +106,10 @@ For production use, you should replace this with a more sophisticated architectu
 - `--data_dir`: Directory containing processed dataset
 - `--batch_size`: Training batch size (default: 4)
 - `--epochs`: Number of training epochs (default: 10)
-- `--d_model`: Model dimension (default: 512)
-- `--n_heads`: Number of attention heads (default: 8)
-- `--n_layers`: Number of transformer layers (default: 6)
+- `--d_model`: Model dimension (default: 768)
+- `--n_heads`: Number of attention heads (default: 12)
+- `--n_layers`: Number of transformer layers (default: 24)
+- `--dropout`: Dropout rate (default: 0.1)
 - `--learning_rate`: Learning rate (default: 1e-4)
 - `--device`: Device to use (auto, cpu, cuda)
 
@@ -109,14 +133,21 @@ After training, checkpoints are saved to the `checkpoints/` directory.
 # Download dataset
 python download_shakespeare_dataset.py
 
-# Train for 20 epochs with larger model
+# Train with default architecture (24 layers, 768 dimensions)
+python train_llada_shakespeare.py \
+    --data_dir shakespeare_dataset \
+    --epochs 20 \
+    --batch_size 8
+
+# Train with custom architecture
 python train_llada_shakespeare.py \
     --data_dir shakespeare_dataset \
     --epochs 20 \
     --batch_size 8 \
-    --d_model 768 \
-    --n_heads 12 \
-    --n_layers 8
+    --d_model 1024 \
+    --n_heads 16 \
+    --n_layers 32 \
+    --dropout 0.15
 ```
 
 ### Custom Sequence Length
@@ -142,6 +173,34 @@ To use this with your existing LLaDA training code:
 - For production training, consider using larger datasets
 - The character-level approach may not be optimal for all use cases
 - Adjust hyperparameters based on your specific requirements and hardware constraints
+
+## Model Scaling Considerations
+
+### Memory Requirements
+- **24 layers, 768 dimensions**: ~15M parameters, suitable for most GPUs
+- **32 layers, 1024 dimensions**: ~45M parameters, requires 8GB+ GPU
+- **48 layers, 1536 dimensions**: ~150M parameters, requires 16GB+ GPU
+
+### Training Tips
+- Start with smaller models for initial experiments
+- Use gradient accumulation for larger models with limited memory
+- Monitor GPU memory usage and adjust batch size accordingly
+- Consider using mixed precision training for larger models
+
+### Model Size Calculator
+
+Use the included `model_size_calculator.py` script to estimate parameters and memory requirements:
+
+```bash
+# Calculate for default architecture
+python model_size_calculator.py
+
+# Calculate for custom architecture
+python model_size_calculator.py --layers 48 --d_model 1536 --n_heads 24
+
+# Get suggestions for your GPU memory
+python model_size_calculator.py --hardware_memory 8
+```
 
 ## Troubleshooting
 
