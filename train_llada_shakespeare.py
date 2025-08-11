@@ -69,8 +69,12 @@ class SimpleTransformerEncoder(nn.Module):
         # Output projection
         self.output_projection = nn.Linear(d_model, vocab_size)
         
-        # Initialize weights
+        # Initialize weights for main model
         self.apply(self._init_weights)
+        
+        # Initialize weights for transformer layers
+        for layer in self.layers:
+            layer.apply(layer._init_weights)
         
         # Print model info
         print(f"Created Transformer with {n_layers} layers, {d_model} dimensions, {n_heads} heads")
@@ -108,6 +112,16 @@ class TransformerLayer(nn.Module):
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
+    
+    def _init_weights(self, module):
+        """Initialize weights for the transformer layer."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.ones_(module.weight)
+            torch.nn.init.zeros_(module.bias)
     
     def forward(self, x):
         # x: (batch_size, seq_len, d_model)
