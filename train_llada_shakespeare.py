@@ -79,6 +79,45 @@ class SimpleTransformerEncoder(nn.Module):
         # Print model info
         print(f"Created Transformer with {n_layers} layers, {d_model} dimensions, {n_heads} heads")
         print(f"Total parameters: {sum(p.numel() for p in self.parameters()):,}")
+    
+    def _init_weights(self, module):
+        """Initialize weights for the main transformer model."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.ones_(module.weight)
+            torch.nn.init.zeros_(module.bias)
+    
+    def forward(self, input_ids):
+        """Forward pass through the transformer encoder."""
+        # input_ids: (batch_size, seq_len)
+        batch_size, seq_len = input_ids.shape
+        
+        # Get embeddings
+        x = self.token_embedding(input_ids)  # (batch_size, seq_len, d_model)
+        
+        # Add positional encoding
+        x = x + self.pos_encoding[:, :seq_len, :]
+        
+        # Apply embedding normalization and dropout
+        x = self.embed_norm(x)
+        x = self.embed_dropout(x)
+        
+        # Pass through transformer layers
+        for layer in self.layers:
+            x = layer(x)
+        
+        # Apply final layer normalization
+        x = self.final_norm(x)
+        
+        # Project to vocabulary
+        logits = self.output_projection(x)  # (batch_size, seq_len, vocab_size)
+        
+        return type('Output', (), {'logits': logits})()
 
 
 class TransformerLayer(nn.Module):
@@ -165,33 +204,6 @@ class TransformerLayer(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, input_ids):
-        # input_ids: (batch_size, seq_len)
-        batch_size, seq_len = input_ids.shape
-        
-        # Get embeddings
-        x = self.token_embedding(input_ids)  # (batch_size, seq_len, d_model)
-        
-        # Add positional encoding
-        x = x + self.pos_encoding[:, :seq_len, :]
-        
-        # Apply embedding normalization and dropout
-        x = self.embed_norm(x)
-        x = self.embed_dropout(x)
-        
-        # Pass through transformer layers
-        for layer in self.layers:
-            x = layer(x)
-        
-        # Apply final layer normalization
-        x = self.final_norm(x)
-        
-        # Project to vocabulary
-        logits = self.output_projection(x)  # (batch_size, seq_len, vocab_size)
-        
-        return type('Output', (), {'logits': logits})()
-
-
 class LLADATrainer:
     """LLaDA trainer implementing the training process from GUIDELINES.md."""
     
