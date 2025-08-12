@@ -187,23 +187,37 @@ class LLADAPretrainedTrainer:
             self.accelerator.backward(loss)
             
             # Enhanced gradient clipping with NaN detection
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # Use accelerator's unwrapped model for gradient clipping
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
             
-            # Check for NaN gradients
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                print(f"Warning: Invalid gradient norm detected: {grad_norm}")
+            # Debug: Check gradient statistics before clipping
+            total_params = 0
+            total_grads = 0
+            nan_grads = 0
+            inf_grads = 0
+            
+            for param in unwrapped_model.parameters():
+                if param.grad is not None:
+                    total_params += 1
+                    total_grads += param.grad.numel()
+                    nan_grads += torch.isnan(param.grad).sum().item()
+                    inf_grads += torch.isinf(param.grad).sum().item()
+            
+            if total_params > 0:
+                print(f"Debug: {total_params} params, {total_grads} gradients, {nan_grads} NaN, {inf_grads} Inf")
+            
+            # Only clip if we have valid gradients
+            if total_grads > 0 and nan_grads == 0 and inf_grads == 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(unwrapped_model.parameters(), max_norm=1.0)
+                
+                # Check for NaN gradients after clipping
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"Warning: Invalid gradient norm detected after clipping: {grad_norm}")
+                    # Skip this update
+                    continue
+            else:
+                print(f"Warning: Skipping gradient clipping due to {nan_grads} NaN and {inf_grads} Inf gradients")
                 # Skip this update
-                continue
-            
-            # Check if any parameters have NaN gradients
-            has_nan_grad = False
-            for param in self.model.parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
-                    has_nan_grad = True
-                    break
-            
-            if has_nan_grad:
-                print(f"Warning: NaN gradients detected, skipping update")
                 continue
             
             # Optimizer step
@@ -211,7 +225,8 @@ class LLADAPretrainedTrainer:
             
             # Check model weights for NaN after update
             has_nan_weights = False
-            for param in self.model.parameters():
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            for param in unwrapped_model.parameters():
                 if torch.isnan(param).any():
                     has_nan_weights = True
                     break

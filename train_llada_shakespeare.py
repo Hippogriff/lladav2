@@ -348,7 +348,9 @@ class LLADATrainer:
             self.accelerator.backward(loss)
             
             # Enhanced gradient clipping with NaN detection
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # Use accelerator's unwrapped model for gradient clipping
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            grad_norm = torch.nn.utils.clip_grad_norm_(unwrapped_model.parameters(), max_norm=1.0)
             
             # Check for NaN gradients
             if torch.isnan(grad_norm) or torch.isinf(grad_norm):
@@ -358,7 +360,7 @@ class LLADATrainer:
             
             # Check if any parameters have NaN gradients
             has_nan_grad = False
-            for param in self.model.parameters():
+            for param in unwrapped_model.parameters():
                 if param.grad is not None and torch.isnan(param.grad).any():
                     has_nan_grad = True
                     break
@@ -373,7 +375,8 @@ class LLADATrainer:
             
             # Check model weights for NaN after update
             has_nan_weights = False
-            for param in self.model.parameters():
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            for param in unwrapped_model.parameters():
                 if torch.isnan(param).any():
                     has_nan_weights = True
                     break
