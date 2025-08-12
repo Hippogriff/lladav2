@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from pathlib import Path
 import time
 from tqdm import tqdm
+from torch.cuda.amp import GradScaler, autocast
 
 
 class SimpleTransformerEncoder(nn.Module):
@@ -211,7 +212,7 @@ class LLADATrainer:
     """LLaDA trainer implementing the training process from GUIDELINES.md."""
     
     def __init__(self, model, vocab_size: int, mask_token: int = 126336, 
-                 device: str = 'cpu', learning_rate: float = 1e-4):
+                 device: str = 'cpu', learning_rate: float = 1e-4, use_fp16: bool = True):
         self.model = model.to(device)
         self.device = device
         self.mask_token = mask_token
@@ -233,6 +234,15 @@ class LLADATrainer:
         # Training stats
         self.train_losses = []
         self.val_losses = []
+        
+        # Mixed precision training
+        self.use_fp16 = use_fp16 and device == "cuda"
+        self.scaler = GradScaler() if self.use_fp16 else None
+        
+        if self.use_fp16:
+            print(f"✓ 16-bit mixed precision training enabled")
+        else:
+            print(f"ℹ️  Using 32-bit precision training")
         
     def forward_process(self, input_ids, eps=1e-3):
         """LLaDA forward process as described in GUIDELINES.md."""
@@ -314,17 +324,27 @@ class LLADATrainer:
                 print(f"Warning: NaN detected in forward process at batch {batch_idx}")
                 continue
             
-            # Compute loss
-            loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
+            # Compute loss with mixed precision
+            if self.use_fp16 and self.scaler is not None:
+                with autocast():
+                    loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
+            else:
+                loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
             
             # Check loss for NaN
             if torch.isnan(loss):
                 print(f"Warning: NaN loss detected at batch {batch_idx}")
                 continue
             
-            # Backward pass
+            # Backward pass with mixed precision
             self.optimizer.zero_grad()
-            loss.backward()
+            
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                # Unscale gradients for clipping
+                self.scaler.unscale_(self.optimizer)
+            else:
+                loss.backward()
             
             # Enhanced gradient clipping with NaN detection
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -346,7 +366,12 @@ class LLADATrainer:
                 print(f"Warning: NaN gradients detected, skipping update")
                 continue
             
-            self.optimizer.step()
+            # Optimizer step with mixed precision
+            if self.scaler is not None:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
             
             # Check model weights for NaN after update
             has_nan_weights = False
@@ -389,8 +414,12 @@ class LLADATrainer:
                 # Apply LLaDA forward process
                 noisy_batch, masked_indices, p_mask = self.forward_process(input_ids)
                 
-                # Compute loss
-                loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
+                # Compute loss with mixed precision
+                if self.use_fp16 and self.scaler is not None:
+                    with autocast():
+                        loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
+                else:
+                    loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
                 total_loss += loss.item()
         
         avg_loss = total_loss / num_batches
@@ -532,6 +561,10 @@ def main():
                        help="Learning rate (default: 5e-5)")
     parser.add_argument("--device", type=str, default="auto",
                        help="Device to use (auto, cpu, cuda)")
+    parser.add_argument("--fp16", action="store_true",
+                       help="Enable 16-bit mixed precision training")
+    parser.add_argument("--no_fp16", action="store_true",
+                       help="Disable 16-bit mixed precision training")
     
     args = parser.parse_args()
     
@@ -560,12 +593,14 @@ def main():
     )
     
     # Create trainer
+    use_fp16 = device == "cuda" and not args.no_fp16
     trainer = LLADATrainer(
         model=model,
         vocab_size=metadata['vocab_size'],
         mask_token=metadata['mask_token'],
         device=device,
-        learning_rate=args.learning_rate
+        learning_rate=args.learning_rate,
+        use_fp16=use_fp16
     )
     
     # Train model

@@ -13,6 +13,7 @@ The scripts implement the LLaDA training process as described in the [GUIDELINES
 - `train_llada_pretrained.py` - Fine-tuning script for pre-trained LLaDA models
 - `test_transformer.py` - Test script for the custom transformer implementation
 - `test_pretrained_model.py` - Test script for pre-trained model loading
+- `test_fp16_memory.py` - Test script for 16-bit memory usage comparison
 - `requirements.txt` - Python dependencies for training from scratch
 - `requirements_pretrained.txt` - Python dependencies for pre-trained models
 - `SHAKESPEARE_README.md` - This file
@@ -98,6 +99,27 @@ Use `train_llada_pretrained.py` to fine-tune the official LLaDA-8B-Instruct mode
 - Smaller batch sizes (1-2)
 - Lower learning rates (1e-5)
 - Transformers library
+
+### **3. 16-bit Mixed Precision Training**
+Both training scripts now support 16-bit mixed precision training for significant memory savings.
+
+**Benefits:**
+- **~50% Memory Reduction**: Use half the GPU memory
+- **Faster Training**: Especially on modern GPUs (RTX 30/40 series, A100, H100)
+- **Larger Batch Sizes**: Train with bigger batches in the same memory
+- **Maintained Quality**: No significant loss in training quality
+
+**Usage:**
+```bash
+# Enable 16-bit training (default on CUDA)
+python train_llada_pretrained.py --data_dir shakespeare_dataset --fp16
+
+# Disable 16-bit (use 32-bit)
+python train_llada_pretrained.py --data_dir shakespeare_dataset --no_fp16
+
+# Test memory savings
+python test_fp16_memory.py
+```
 
 ## Model Architecture
 
