@@ -26,7 +26,9 @@ from torch.utils.data import DataLoader, TensorDataset
 from pathlib import Path
 import time
 from tqdm import tqdm
-from torch.cuda.amp import GradScaler, autocast
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import set_seed
 
 
 class SimpleTransformerEncoder(nn.Module):
@@ -212,12 +214,20 @@ class LLADATrainer:
     """LLaDA trainer implementing the training process from GUIDELINES.md."""
     
     def __init__(self, model, vocab_size: int, mask_token: int = 126336, 
-                 device: str = 'cpu', learning_rate: float = 1e-4, use_fp16: bool = True):
-        self.model = model.to(device)
-        self.device = device
+                 learning_rate: float = 1e-4, mixed_precision: str = 'fp16'):
         self.mask_token = mask_token
         self.vocab_size = vocab_size
         self.learning_rate = learning_rate
+        
+        # Initialize accelerator for mixed precision and device management
+        self.accelerator = Accelerator(
+            mixed_precision=mixed_precision,
+            log_with="tensorboard",
+            project_dir="./logs"
+        )
+        
+        # Move model to device and prepare for training
+        self.model = self.accelerator.prepare(model)
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
@@ -231,16 +241,18 @@ class LLADATrainer:
             anneal_strategy='cos'
         )
         
+        # Prepare optimizer and scheduler with accelerator
+        self.optimizer, self.scheduler = self.accelerator.prepare(self.optimizer, self.scheduler)
+        
         # Training stats
         self.train_losses = []
         self.val_losses = []
         
-        # Mixed precision training
-        self.use_fp16 = use_fp16 and device == "cuda"
-        self.scaler = GradScaler() if self.use_fp16 else None
-        
-        if self.use_fp16:
-            print(f"✓ 16-bit mixed precision training enabled")
+        # Log mixed precision status
+        if mixed_precision == 'fp16':
+            print(f"✓ 16-bit mixed precision training enabled via Accelerate")
+        elif mixed_precision == 'bf16':
+            print(f"✓ BFloat16 mixed precision training enabled via Accelerate")
         else:
             print(f"ℹ️  Using 32-bit precision training")
         
@@ -336,64 +348,32 @@ class LLADATrainer:
                 print(f"Warning: NaN loss detected at batch {batch_idx}")
                 continue
             
-            # Backward pass with mixed precision
-            self.optimizer.zero_grad()
+            # Backward pass with accelerator
+            self.accelerator.backward(loss)
             
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
-                # Unscale gradients for clipping
-                self.scaler.unscale_(self.optimizer)
-                
-                # Enhanced gradient clipping with NaN detection
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
-                # Check for NaN gradients
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    print(f"Warning: Invalid gradient norm detected: {grad_norm}")
-                    # Skip this update but update scaler to maintain consistency
-                    self.scaler.update()
-                    continue
-                
-                # Check if any parameters have NaN gradients
-                has_nan_grad = False
-                for param in self.model.parameters():
-                    if param.grad is not None and torch.isnan(param.grad).any():
-                        has_nan_grad = True
-                        break
-                
-                if has_nan_grad:
-                    print(f"Warning: NaN gradients detected, skipping update")
-                    # Skip this update but update scaler to maintain consistency
-                    self.scaler.update()
-                    continue
-                
-                # Optimizer step with mixed precision
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                
-                # Enhanced gradient clipping with NaN detection
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
-                # Check for NaN gradients
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    print(f"Warning: Invalid gradient norm detected: {grad_norm}")
-                    # Skip this update
-                    continue
-                
-                # Check if any parameters have NaN gradients
-                has_nan_grad = False
-                for param in self.model.parameters():
-                    if param.grad is not None and torch.isnan(param.grad).any():
-                        has_nan_grad = True
-                        break
-                
-                if has_nan_grad:
-                    print(f"Warning: NaN gradients detected, skipping update")
-                    continue
-                
-                self.optimizer.step()
+            # Enhanced gradient clipping with NaN detection
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            # Check for NaN gradients
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                print(f"Warning: Invalid gradient norm detected: {grad_norm}")
+                # Skip this update
+                continue
+            
+            # Check if any parameters have NaN gradients
+            has_nan_grad = False
+            for param in self.model.parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    has_nan_grad = True
+                    break
+            
+            if has_nan_grad:
+                print(f"Warning: NaN gradients detected, skipping update")
+                # Skip this update
+                continue
+            
+            # Step optimizer
+            self.optimizer.step()
             
             # Check model weights for NaN after update
             has_nan_weights = False
@@ -431,17 +411,13 @@ class LLADATrainer:
         
         with torch.no_grad():
             for batch in val_loader:
-                input_ids = batch[0].to(self.device)
+                input_ids = batch[0]
                 
                 # Apply LLaDA forward process
                 noisy_batch, masked_indices, p_mask = self.forward_process(input_ids)
                 
-                # Compute loss with mixed precision
-                if self.use_fp16 and self.scaler is not None:
-                    with autocast():
-                        loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
-                else:
-                    loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
+                # Compute loss
+                loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
                 total_loss += loss.item()
         
         avg_loss = total_loss / num_batches
@@ -615,15 +591,17 @@ def main():
     )
     
     # Create trainer
-    use_fp16 = device == "cuda" and not args.no_fp16
+    mixed_precision = 'fp16' if device == "cuda" and not args.no_fp16 else 'no'
     trainer = LLADATrainer(
         model=model,
         vocab_size=metadata['vocab_size'],
         mask_token=metadata['mask_token'],
-        device=device,
         learning_rate=args.learning_rate,
-        use_fp16=use_fp16
+        mixed_precision=mixed_precision
     )
+    
+    # Prepare data loaders with accelerator
+    train_loader, val_loader = trainer.accelerator.prepare(train_loader, val_loader)
     
     # Train model
     trainer.train(

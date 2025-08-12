@@ -5,3 +5,4 @@ tqdm>=4.60.0
 pathlib2>=2.3.0; python_version < "3.4"
 accelerate>=0.20.0
 safetensors>=0.3.0
+datasets>=2.0.0

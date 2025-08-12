@@ -14,6 +14,7 @@ The scripts implement the LLaDA training process as described in the [GUIDELINES
 - `test_transformer.py` - Test script for the custom transformer implementation
 - `test_pretrained_model.py` - Test script for pre-trained model loading
 - `test_fp16_memory.py` - Test script for 16-bit memory usage comparison
+- `test_accelerate_integration.py` - Test script to verify accelerate integration
 - `requirements.txt` - Python dependencies for training from scratch
 - `requirements_pretrained.txt` - Python dependencies for pre-trained models
 - `SHAKESPEARE_README.md` - This file
@@ -100,25 +101,36 @@ Use `train_llada_pretrained.py` to fine-tune the official LLaDA-8B-Instruct mode
 - Lower learning rates (1e-5)
 - Transformers library
 
-### **3. 16-bit Mixed Precision Training**
-Both training scripts now support 16-bit mixed precision training for significant memory savings.
+### **3. Mixed Precision Training with Accelerate**
+Both training scripts now use the **Accelerate** library for robust mixed precision training, automatic device management, and enhanced training features.
+
+**Supported Precision Modes:**
+- **`fp16`**: 16-bit mixed precision (recommended for most GPUs)
+- **`bf16`**: BFloat16 mixed precision (better for newer GPUs like A100, H100)
+- **`no`**: 32-bit precision (fallback for CPU or compatibility)
 
 **Benefits:**
 - **~50% Memory Reduction**: Use half the GPU memory
 - **Faster Training**: Especially on modern GPUs (RTX 30/40 series, A100, H100)
 - **Larger Batch Sizes**: Train with bigger batches in the same memory
 - **Maintained Quality**: No significant loss in training quality
+- **Automatic Management**: No manual GradScaler handling
+- **Device Optimization**: Automatic CPU/GPU/TPU detection
+- **Distributed Training**: Easy scaling to multiple GPUs/nodes
 
 **Usage:**
 ```bash
 # Enable 16-bit training (default on CUDA)
 python train_llada_pretrained.py --data_dir shakespeare_dataset --fp16
 
-# Disable 16-bit (use 32-bit)
+# Use BFloat16 (if supported)
+python train_llada_pretrained.py --data_dir shakespeare_dataset --bf16
+
+# Disable mixed precision
 python train_llada_pretrained.py --data_dir shakespeare_dataset --no_fp16
 
-# Test memory savings
-python test_fp16_memory.py
+# Test accelerate integration
+python test_accelerate_integration.py
 ```
 
 ## Model Architecture
