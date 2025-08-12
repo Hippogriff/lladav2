@@ -9,9 +9,12 @@ The scripts implement the LLaDA training process as described in the [GUIDELINES
 ## Files
 
 - `download_shakespeare_dataset.py` - Downloads and preprocesses the Shakespeare dataset
-- `train_llada_shakespeare.py` - Training script for LLaDA
+- `train_llada_shakespeare.py` - Training script for LLaDA (from scratch)
+- `train_llada_pretrained.py` - Fine-tuning script for pre-trained LLaDA models
 - `test_transformer.py` - Test script for the custom transformer implementation
-- `requirements.txt` - Python dependencies
+- `test_pretrained_model.py` - Test script for pre-trained model loading
+- `requirements.txt` - Python dependencies for training from scratch
+- `requirements_pretrained.txt` - Python dependencies for pre-trained models
 - `SHAKESPEARE_README.md` - This file
 
 ## Quick Start
@@ -25,7 +28,11 @@ pip install -r requirements.txt
 ### 2. Test Transformer Implementation
 
 ```bash
+# Test custom transformer
 python test_transformer.py
+
+# Test pre-trained model loading
+python test_pretrained_model.py
 ```
 
 ### 3. Download and Preprocess Dataset
@@ -44,7 +51,11 @@ This will:
 ### 4. Train LLaDA
 
 ```bash
+# Train from scratch
 python train_llada_shakespeare.py --data_dir shakespeare_dataset --epochs 10 --batch_size 4
+
+# Fine-tune pre-trained model
+python train_llada_pretrained.py --data_dir shakespeare_dataset --epochs 5 --batch_size 1
 ```
 
 ## Dataset Format
@@ -68,9 +79,27 @@ The training implements the forward process described in GUIDELINES.md:
 3. **Model Prediction**: The model predicts the original tokens at masked positions
 4. **Loss Computation**: Cross-entropy loss with importance weighting by masking probability
 
-## Model Architecture
+## Training Options
 
-The training script includes a custom Transformer Encoder implementation optimized for LLaDA:
+### **1. Training from Scratch**
+Use `train_llada_shakespeare.py` to train a custom transformer from scratch.
+
+### **2. Fine-tuning Pre-trained Models**
+Use `train_llada_pretrained.py` to fine-tune the official LLaDA-8B-Instruct model.
+
+**Advantages of Fine-tuning:**
+- **Pre-trained Knowledge**: Leverages 8B parameters of pre-trained knowledge
+- **Faster Convergence**: Requires fewer epochs (5 vs 10+)
+- **Better Performance**: Higher quality results with less data
+- **Production Ready**: Based on the official LLaDA implementation
+
+**Requirements:**
+- More GPU memory (16GB+ recommended)
+- Smaller batch sizes (1-2)
+- Lower learning rates (1e-5)
+- Transformers library
+
+## Model Architecture
 
 - **Custom Attention**: Uses `scaled_dot_product_attention` without causal masking
 - **Bidirectional Processing**: Full attention across all positions (non-autoregressive)
@@ -127,7 +156,7 @@ After training, checkpoints are saved to the `checkpoints/` directory.
 
 ## Example Usage
 
-### Basic Training
+### Training from Scratch
 
 ```bash
 # Download dataset
@@ -148,6 +177,27 @@ python train_llada_shakespeare.py \
     --n_heads 16 \
     --n_layers 32 \
     --dropout 0.15
+```
+
+### Fine-tuning Pre-trained Model
+
+```bash
+# Download dataset
+python download_shakespeare_dataset.py
+
+# Fine-tune with default settings
+python train_llada_pretrained.py \
+    --data_dir shakespeare_dataset \
+    --epochs 5 \
+    --batch_size 1
+
+# Fine-tune with custom settings
+python train_llada_pretrained.py \
+    --data_dir shakespeare_dataset \
+    --epochs 10 \
+    --batch_size 2 \
+    --learning_rate 2e-5 \
+    --model_name GSAI-ML/LLaDA-8B-Base
 ```
 
 ### Custom Sequence Length
