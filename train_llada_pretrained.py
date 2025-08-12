@@ -160,7 +160,7 @@ class LLADAPretrainedTrainer:
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}")
         
         for batch_idx, batch in enumerate(progress_bar):
-            input_ids = batch[0].to(self.device)
+            input_ids = batch[0]
             
             # Check input for NaN
             if torch.isnan(input_ids).any():
@@ -175,12 +175,8 @@ class LLADAPretrainedTrainer:
                 print(f"Warning: NaN detected in forward process at batch {batch_idx}")
                 continue
             
-            # Compute loss with mixed precision
-            if self.scaler is not None:
-                with autocast():
-                    loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
-            else:
-                loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
+            # Compute loss
+            loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
             
             # Check loss for NaN
             if torch.isnan(loss):

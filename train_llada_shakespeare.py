@@ -321,7 +321,7 @@ class LLADATrainer:
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}")
         
         for batch_idx, batch in enumerate(progress_bar):
-            input_ids = batch[0].to(self.device)
+            input_ids = batch[0]
             
             # Check input for NaN
             if torch.isnan(input_ids).any():
@@ -336,12 +336,8 @@ class LLADATrainer:
                 print(f"Warning: NaN detected in forward process at batch {batch_idx}")
                 continue
             
-            # Compute loss with mixed precision
-            if self.use_fp16 and self.scaler is not None:
-                with autocast():
-                    loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
-            else:
-                loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
+            # Compute loss
+            loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
             
             # Check loss for NaN
             if torch.isnan(loss):
@@ -448,7 +444,7 @@ class LLADATrainer:
     def train(self, train_loader, val_loader, num_epochs: int, save_dir: str = "checkpoints"):
         """Main training loop."""
         print(f"Starting training for {num_epochs} epochs...")
-        print(f"Device: {self.device}")
+        print(f"Mixed precision: {self.accelerator.mixed_precision}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
         # Update scheduler total steps
