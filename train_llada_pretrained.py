@@ -116,38 +116,48 @@ class LLADAPretrainedTrainer:
     
     def compute_loss(self, input_ids, noisy_batch, masked_indices, p_mask):
         """Compute LLaDA loss as described in GUIDELINES.md."""
-        # Get model predictions
-        outputs = self.model(input_ids=noisy_batch)
-        logits = outputs.logits
+        # Forward pass through the model
+        outputs = self.model(inputs_embeds=noisy_batch)
+        logits = outputs.logits if hasattr(outputs, 'logits') else outputs.last_hidden_state
         
-        # Add numerical stability to logits
+        # Ensure logits have the right shape for loss computation
+        if len(logits.shape) == 3:
+            # If logits are (batch_size, seq_len, vocab_size), we need to reshape
+            batch_size, seq_len, vocab_size = logits.shape
+            logits = logits.view(-1, vocab_size)
+            target_ids = input_ids.view(-1)
+        else:
+            # If logits are already flattened
+            target_ids = input_ids.view(-1)
+        
+        # Clamp logits for numerical stability
         logits = torch.clamp(logits, min=-100, max=100)
         
-        # Compute token-level loss
-        token_loss = F.cross_entropy(
-            logits[masked_indices], 
-            input_ids[masked_indices], 
-            reduction='none'
-        )
+        # Compute cross-entropy loss
+        loss_fct = nn.CrossEntropyLoss(reduction='none')
+        token_loss = loss_fct(logits, target_ids)
         
-        # Apply importance weighting with numerical stability
-        # Add small epsilon to prevent division by zero
-        eps = 1e-8
-        p_mask_stable = torch.clamp(p_mask, min=eps, max=1.0)
-        token_loss = token_loss / p_mask_stable[masked_indices]
+        # Reshape token loss back to (batch_size, seq_len)
+        token_loss = token_loss.view(batch_size, seq_len)
         
-        # Check for NaN in token loss
-        if torch.isnan(token_loss).any():
-            print(f"Warning: NaN detected in token loss")
-            token_loss = torch.nan_to_num(token_loss, nan=0.0, posinf=100.0, neginf=-100.0)
+        # Apply importance weighting: 1 / p_mask for masked tokens
+        p_mask_stable = torch.clamp(p_mask, min=1e-8, max=1.0)
+        importance_weights = 1.0 / p_mask_stable
         
-        # Compute final loss with numerical stability
-        loss = token_loss.sum() / (input_ids.shape[0] * input_ids.shape[1])
+        # Apply weights only to masked tokens
+        weighted_loss = token_loss * importance_weights * masked_indices.float()
         
-        # Final NaN check
+        # Average over masked tokens
+        num_masked = masked_indices.sum()
+        if num_masked > 0:
+            loss = weighted_loss.sum() / num_masked
+        else:
+            loss = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+        
+        # Handle NaN in loss
         if torch.isnan(loss):
-            print(f"Warning: NaN detected in final loss, using fallback loss")
-            loss = torch.tensor(10.0, device=loss.device, requires_grad=True)
+            print("Warning: NaN loss detected, using fallback")
+            loss = torch.tensor(10.0, device=input_ids.device, requires_grad=True)
         
         return loss
     
@@ -208,11 +218,17 @@ class LLADAPretrainedTrainer:
             
             # Only clip if we have valid gradients
             if total_grads > 0 and nan_grads == 0 and inf_grads == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(unwrapped_model.parameters(), max_norm=1.0)
-                
-                # Check for NaN gradients after clipping
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    print(f"Warning: Invalid gradient norm detected after clipping: {grad_norm}")
+                try:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(unwrapped_model.parameters(), max_norm=1.0)
+                    print(f"Debug: Gradient norm after clipping: {grad_norm:.6f}")
+                    
+                    # Check for NaN gradients after clipping
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        print(f"Warning: Invalid gradient norm detected after clipping: {grad_norm}")
+                        # Skip this update
+                        continue
+                except Exception as e:
+                    print(f"Warning: Error during gradient clipping: {e}")
                     # Skip this update
                     continue
             else:
