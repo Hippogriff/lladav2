@@ -343,34 +343,56 @@ class LLADATrainer:
                 self.scaler.scale(loss).backward()
                 # Unscale gradients for clipping
                 self.scaler.unscale_(self.optimizer)
-            else:
-                loss.backward()
-            
-            # Enhanced gradient clipping with NaN detection
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
-            # Check for NaN gradients
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                print(f"Warning: Invalid gradient norm detected: {grad_norm}")
-                # Skip this update
-                continue
-            
-            # Check if any parameters have NaN gradients
-            has_nan_grad = False
-            for param in self.model.parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
-                    has_nan_grad = True
-                    break
-            
-            if has_nan_grad:
-                print(f"Warning: NaN gradients detected, skipping update")
-                continue
-            
-            # Optimizer step with mixed precision
-            if self.scaler is not None:
+                
+                # Enhanced gradient clipping with NaN detection
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                # Check for NaN gradients
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"Warning: Invalid gradient norm detected: {grad_norm}")
+                    # Skip this update but update scaler to maintain consistency
+                    self.scaler.update()
+                    continue
+                
+                # Check if any parameters have NaN gradients
+                has_nan_grad = False
+                for param in self.model.parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    print(f"Warning: NaN gradients detected, skipping update")
+                    # Skip this update but update scaler to maintain consistency
+                    self.scaler.update()
+                    continue
+                
+                # Optimizer step with mixed precision
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
+                loss.backward()
+                
+                # Enhanced gradient clipping with NaN detection
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                # Check for NaN gradients
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"Warning: Invalid gradient norm detected: {grad_norm}")
+                    # Skip this update
+                    continue
+                
+                # Check if any parameters have NaN gradients
+                has_nan_grad = False
+                for param in self.model.parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    print(f"Warning: NaN gradients detected, skipping update")
+                    continue
+                
                 self.optimizer.step()
             
             # Check model weights for NaN after update
