@@ -53,7 +53,7 @@ class LLADAPretrainedTrainer:
         self.val_losses = []
         
         # Mixed precision training
-        self.use_fp16 = device == "cuda" and not hasattr(args, 'no_fp16')
+        self.use_fp16 = use_fp16 and device == "cuda"
         self.scaler = GradScaler() if self.use_fp16 else None
         
         if self.use_fp16:
