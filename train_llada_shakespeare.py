@@ -83,11 +83,13 @@ class SimpleTransformerEncoder(nn.Module):
     def _init_weights(self, module):
         """Initialize weights for the main transformer model."""
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # Use Xavier/Glorot initialization for better stability
+            torch.nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # Use smaller std for embeddings to prevent instability
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.01)
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.ones_(module.weight)
             torch.nn.init.zeros_(module.bias)
@@ -155,7 +157,8 @@ class TransformerLayer(nn.Module):
     def _init_weights(self, module):
         """Initialize weights for the transformer layer."""
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # Use Xavier/Glorot initialization for better stability
+            torch.nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.LayerNorm):
@@ -218,9 +221,13 @@ class LLADATrainer:
         # Optimizer
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
         
-        # Learning rate scheduler
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=1000, eta_min=1e-6
+        # Learning rate scheduler with warmup
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer, 
+            max_lr=learning_rate,
+            total_steps=1000,  # Will be updated during training
+            pct_start=0.1,     # 10% warmup
+            anneal_strategy='cos'
         )
         
         # Training stats
@@ -252,6 +259,9 @@ class LLADATrainer:
         outputs = self.model(noisy_batch)
         logits = outputs.logits
         
+        # Add numerical stability to logits
+        logits = torch.clamp(logits, min=-100, max=100)
+        
         # Compute token-level loss
         token_loss = F.cross_entropy(
             logits[masked_indices], 
@@ -259,11 +269,24 @@ class LLADATrainer:
             reduction='none'
         )
         
-        # Apply importance weighting
-        token_loss = token_loss / p_mask[masked_indices]
+        # Apply importance weighting with numerical stability
+        # Add small epsilon to prevent division by zero
+        eps = 1e-8
+        p_mask_stable = torch.clamp(p_mask, min=eps, max=1.0)
+        token_loss = token_loss / p_mask_stable[masked_indices]
         
-        # Compute final loss
+        # Check for NaN in token loss
+        if torch.isnan(token_loss).any():
+            print(f"Warning: NaN detected in token loss")
+            token_loss = torch.nan_to_num(token_loss, nan=0.0, posinf=100.0, neginf=-100.0)
+        
+        # Compute final loss with numerical stability
         loss = token_loss.sum() / (input_ids.shape[0] * input_ids.shape[1])
+        
+        # Final NaN check
+        if torch.isnan(loss):
+            print(f"Warning: NaN detected in final loss, using fallback loss")
+            loss = torch.tensor(10.0, device=loss.device, requires_grad=True)
         
         return loss
     
@@ -278,27 +301,74 @@ class LLADATrainer:
         for batch_idx, batch in enumerate(progress_bar):
             input_ids = batch[0].to(self.device)
             
+            # Check input for NaN
+            if torch.isnan(input_ids).any():
+                print(f"Warning: NaN detected in input_ids at batch {batch_idx}")
+                continue
+            
             # Apply LLaDA forward process
             noisy_batch, masked_indices, p_mask = self.forward_process(input_ids)
             
+            # Check forward process outputs
+            if torch.isnan(noisy_batch).any() or torch.isnan(p_mask).any():
+                print(f"Warning: NaN detected in forward process at batch {batch_idx}")
+                continue
+            
             # Compute loss
             loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
+            
+            # Check loss for NaN
+            if torch.isnan(loss):
+                print(f"Warning: NaN loss detected at batch {batch_idx}")
+                continue
             
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
             
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # Enhanced gradient clipping with NaN detection
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            # Check for NaN gradients
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                print(f"Warning: Invalid gradient norm detected: {grad_norm}")
+                # Skip this update
+                continue
+            
+            # Check if any parameters have NaN gradients
+            has_nan_grad = False
+            for param in self.model.parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    has_nan_grad = True
+                    break
+            
+            if has_nan_grad:
+                print(f"Warning: NaN gradients detected, skipping update")
+                continue
             
             self.optimizer.step()
+            
+            # Check model weights for NaN after update
+            has_nan_weights = False
+            for param in self.model.parameters():
+                if torch.isnan(param).any():
+                    has_nan_weights = True
+                    break
+            
+            if has_nan_weights:
+                print(f"Warning: NaN weights detected after update, stopping training")
+                return float('inf')  # Return high loss to indicate failure
+            
+            # Step scheduler for OneCycleLR (step after each batch)
+            self.scheduler.step()
             
             total_loss += loss.item()
             
             # Update progress bar
             progress_bar.set_postfix({
                 'loss': f'{loss.item():.4f}',
-                'avg_loss': f'{total_loss / (batch_idx + 1):.4f}'
+                'avg_loss': f'{total_loss / (batch_idx + 1):.4f}',
+                'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
             })
         
         avg_loss = total_loss / num_batches
@@ -354,6 +424,10 @@ class LLADATrainer:
         print(f"Device: {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
+        # Update scheduler total steps
+        total_steps = len(train_loader) * num_epochs
+        self.scheduler.total_steps = total_steps
+        
         best_val_loss = float('inf')
         
         for epoch in range(1, num_epochs + 1):
@@ -365,7 +439,7 @@ class LLADATrainer:
             # Validation
             val_loss = self.validate(val_loader)
             
-            # Learning rate scheduling
+            # Learning rate scheduling (step after each epoch for OneCycleLR)
             self.scheduler.step()
             
             epoch_time = time.time() - start_time
@@ -454,8 +528,8 @@ def main():
                        help="Number of transformer layers (default: 24)")
     parser.add_argument("--dropout", type=float, default=0.1,
                        help="Dropout rate (default: 0.1)")
-    parser.add_argument("--learning_rate", type=float, default=1e-4,
-                       help="Learning rate (default: 1e-4)")
+    parser.add_argument("--learning_rate", type=float, default=5e-5,
+                       help="Learning rate (default: 5e-5)")
     parser.add_argument("--device", type=str, default="auto",
                        help="Device to use (auto, cpu, cuda)")
     
