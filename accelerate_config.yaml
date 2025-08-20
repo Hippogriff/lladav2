@@ -18,3 +18,12 @@ tpu_env: []
 tpu_use_cluster: false
 tpu_use_sudo: false
 use_cpu: false
+
+# NCCL configuration to fix network issues
+env:
+  NCCL_DEBUG: INFO
+  NCCL_IB_DISABLE: 1
+  NCCL_P2P_DISABLE: 1
+  NCCL_SOCKET_IFNAME: lo
+  NCCL_BLOCKING_WAIT: 1
+  NCCL_TIMEOUT: 1800

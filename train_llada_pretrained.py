@@ -86,10 +86,65 @@ class TrainingConfig:
         }
 
 
+def diagnose_nccl_issues():
+    """Diagnose and fix common NCCL issues."""
+    print("Diagnosing NCCL configuration...")
+    
+    # Check CUDA availability
+    if not torch.cuda.is_available():
+        print("CUDA not available, skipping NCCL diagnosis")
+        return
+    
+    # Check number of GPUs
+    num_gpus = torch.cuda.device_count()
+    print(f"Found {num_gpus} GPU(s)")
+    
+    if num_gpus <= 1:
+        print("Single GPU detected, NCCL not needed")
+        return
+    
+    # Set NCCL environment variables
+    nccl_vars = {
+        'NCCL_DEBUG': 'INFO',
+        'NCCL_IB_DISABLE': '1',
+        'NCCL_P2P_DISABLE': '1',
+        'NCCL_SOCKET_IFNAME': 'lo',
+        'NCCL_BLOCKING_WAIT': '1',
+        'NCCL_TIMEOUT': '1800',
+        'NCCL_SHM_DISABLE': '1',  # Disable shared memory if having issues
+        'NCCL_NET_GDR_LEVEL': '0'  # Disable GPU Direct RDMA
+    }
+    
+    print("Setting NCCL environment variables:")
+    for var, value in nccl_vars.items():
+        os.environ[var] = value
+        print(f"  {var}={value}")
+    
+    # Test basic GPU communication
+    try:
+        print("Testing GPU communication...")
+        for i in range(num_gpus):
+            torch.cuda.set_device(i)
+            x = torch.randn(10, 10, device=f'cuda:{i}')
+            print(f"  GPU {i}: {x.device} - OK")
+        print("GPU communication test passed")
+    except Exception as e:
+        print(f"GPU communication test failed: {e}")
+        print("Consider using single-machine configuration")
+
+
 def setup_accelerate_logging():
     """Setup logging configuration for Accelerate."""
     # Create logs directory
     os.makedirs("./logs", exist_ok=True)
+    
+    # Setup NCCL environment variables to avoid network issues
+    os.environ.setdefault('NCCL_DEBUG', 'INFO')
+    os.environ.setdefault('NCCL_IB_DISABLE', '1')
+    os.environ.setdefault('NCCL_P2P_DISABLE', '1')
+    os.environ.setdefault('NCCL_SOCKET_IFNAME', 'lo')
+    os.environ.setdefault('NCCL_BLOCKING_WAIT', '1')
+    os.environ.setdefault('NCCL_TIMEOUT', '1800')
     
     # Setup wandb if available
     try:
@@ -102,6 +157,9 @@ def setup_accelerate_logging():
 
 def create_accelerator_config(config: TrainingConfig) -> Accelerator:
     """Create and configure Accelerator instance."""
+    # Diagnose and fix NCCL issues
+    diagnose_nccl_issues()
+    
     return Accelerator(
         mixed_precision=config.mixed_precision,
         log_with="tensorboard",
