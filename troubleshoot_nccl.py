@@ -131,6 +131,7 @@ def test_distributed_training():
         
         # Create a simple model
         model = torch.nn.Linear(10, 1).to(accelerator.device)
+        # model = torch.nn.parallel.DistributedDataParallel(model)
         optimizer = torch.optim.Adam(model.parameters())
         
         # Prepare model and optimizer
