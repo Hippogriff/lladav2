@@ -3,7 +3,8 @@
 LLaDA Pre-trained Model Training Script
 
 This script loads the pre-trained LLaDA-8B-Instruct model from Hugging Face
-and fine-tunes it on the Shakespeare dataset using the LLaDA training process.
+and fine-tunes it on the Shakespeare dataset using the LLaDA training process
+with full Accelerate integration for distributed training.
 """
 
 import os
@@ -17,46 +18,157 @@ from torch.utils.data import DataLoader, TensorDataset
 from pathlib import Path
 import time
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, DummyScheduler, DummyOptim
+from accelerate.tracking import TrackerMixin
+import wandb
+import math
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class TrainingConfig:
+    """Configuration class for training parameters."""
+    # Model and data
+    model_name: str = "GSAI-ML/LLaDA-8B-Instruct"
+    data_dir: str = ""
+    mask_token: int = 126336
+    
+    # Training hyperparameters
+    learning_rate: float = 1e-5
+    weight_decay: float = 0.01
+    warmup_steps: int = 100
+    max_grad_norm: float = 1.0
+    num_epochs: int = 5
+    
+    # Batch and optimization
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 1
+    dataloader_num_workers: int = 4
+    
+    # Logging and saving
+    logging_steps: int = 10
+    save_steps: int = 500
+    eval_steps: int = 500
+    save_dir: str = "checkpoints_pretrained"
+    
+    # Mixed precision
+    mixed_precision: str = "fp16"
+    
+    # Reproducibility
+    seed: int = 42
+    
+    # Checkpointing
+    resume_from_checkpoint: Optional[str] = None
+    
+    @property
+    def effective_batch_size(self) -> int:
+        """Calculate effective batch size across all devices and accumulation steps."""
+        return self.batch_size * self.gradient_accumulation_steps
+    
+    def to_dict(self) -> dict:
+        """Convert config to dictionary for logging."""
+        return {
+            'model_name': self.model_name,
+            'learning_rate': self.learning_rate,
+            'weight_decay': self.weight_decay,
+            'warmup_steps': self.warmup_steps,
+            'max_grad_norm': self.max_grad_norm,
+            'num_epochs': self.num_epochs,
+            'batch_size': self.batch_size,
+            'gradient_accumulation_steps': self.gradient_accumulation_steps,
+            'effective_batch_size': self.effective_batch_size,
+            'mixed_precision': self.mixed_precision,
+            'seed': self.seed
+        }
+
+
+def setup_accelerate_logging():
+    """Setup logging configuration for Accelerate."""
+    # Create logs directory
+    os.makedirs("./logs", exist_ok=True)
+    
+    # Setup wandb if available
+    try:
+        import wandb
+        if wandb.run is None:
+            wandb.init(project="llada-pretrained", name="llada-shakespeare-finetuning")
+    except ImportError:
+        print("Wandb not available, skipping wandb logging")
+
+
+def create_accelerator_config(config: TrainingConfig) -> Accelerator:
+    """Create and configure Accelerator instance."""
+    return Accelerator(
+        mixed_precision=config.mixed_precision,
+        log_with="tensorboard",
+        project_dir="./logs",
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        dataloader_num_workers=config.dataloader_num_workers,
+        kwargs_handlers=[DummyScheduler, DummyOptim] if config.mixed_precision == "no" else None
+    )
 
 
 class LLADAPretrainedTrainer:
-    """LLaDA trainer for pre-trained models implementing the training process from GUIDELINES.md."""
+    """LLaDA trainer for pre-trained models with full Accelerate integration."""
     
     def __init__(self, model, tokenizer, mask_token: int = 126336, 
-                 learning_rate: float = 1e-5, mixed_precision: str = 'fp16'):
+                 learning_rate: float = 1e-5, mixed_precision: str = 'fp16',
+                 weight_decay: float = 0.01, warmup_steps: int = 100,
+                 max_grad_norm: float = 1.0, logging_steps: int = 10,
+                 save_steps: int = 500, eval_steps: int = 500,
+                 gradient_accumulation_steps: int = 1, dataloader_num_workers: int = 4):
         self.tokenizer = tokenizer
         self.mask_token = mask_token
         self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.warmup_steps = warmup_steps
+        self.max_grad_norm = max_grad_norm
+        self.logging_steps = logging_steps
+        self.save_steps = save_steps
+        self.eval_steps = eval_steps
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.dataloader_num_workers = dataloader_num_workers
         
         # Get vocabulary size from tokenizer
         self.vocab_size = len(tokenizer)
-        print(f"Vocabulary size: {self.vocab_size}")
         
-        # Initialize accelerator for mixed precision and device management
+        # Initialize accelerator with enhanced configuration
         self.accelerator = Accelerator(
             mixed_precision=mixed_precision,
             log_with="tensorboard",
-            project_dir="./logs"
+            project_dir="./logs",
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            dataloader_num_workers=dataloader_num_workers
         )
+        
+        # Get logger
+        self.logger = get_logger(__name__)
+        
+        # Set seed for reproducibility
+        set_seed(42)
+        
+        # Log accelerator configuration
+        self.logger.info(f"Accelerator configuration:")
+        self.logger.info(f"  - Mixed precision: {mixed_precision}")
+        self.logger.info(f"  - Gradient accumulation steps: {gradient_accumulation_steps}")
+        self.logger.info(f"  - Dataloader workers: {dataloader_num_workers}")
+        self.logger.info(f"  - Device: {self.accelerator.device}")
+        self.logger.info(f"  - Process index: {self.accelerator.process_index}")
+        self.logger.info(f"  - Local process index: {self.accelerator.local_process_index}")
+        self.logger.info(f"  - Num processes: {self.accelerator.num_processes}")
         
         # Move model to device and prepare for training
         self.model = self.accelerator.prepare(model)
         
-        # Optimizer - use different learning rates for different parameter groups
+        # Create optimizer with proper parameter grouping
         self.optimizer = self._create_optimizer()
         
-        # Learning rate scheduler with warmup
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer, 
-            max_lr=learning_rate,
-            total_steps=1000,  # Will be updated during training
-            pct_start=0.1,     # 10% warmup
-            anneal_strategy='cos'
-        )
+        # Create learning rate scheduler
+        self.scheduler = self._create_scheduler()
         
         # Prepare optimizer and scheduler with accelerator
         self.optimizer, self.scheduler = self.accelerator.prepare(self.optimizer, self.scheduler)
@@ -64,14 +176,21 @@ class LLADAPretrainedTrainer:
         # Training stats
         self.train_losses = []
         self.val_losses = []
+        self.global_step = 0
+        self.best_val_loss = float('inf')
+        
+        # Log model information
+        self.logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        self.logger.info(f"Vocabulary size: {self.vocab_size}")
+        self.logger.info(f"Mask token: {self.mask_token}")
         
         # Log mixed precision status
         if mixed_precision == 'fp16':
-            print(f"✓ 16-bit mixed precision training enabled via Accelerate")
+            self.logger.info("✓ 16-bit mixed precision training enabled via Accelerate")
         elif mixed_precision == 'bf16':
-            print(f"✓ BFloat16 mixed precision training enabled via Accelerate")
+            self.logger.info("✓ BFloat16 mixed precision training enabled via Accelerate")
         else:
-            print(f"ℹ️  Using 32-bit precision training")
+            self.logger.info("ℹ️  Using 32-bit precision training")
         
     def _create_optimizer(self):
         """Create optimizer with different learning rates for different parameter groups."""
@@ -82,7 +201,7 @@ class LLADAPretrainedTrainer:
             {
                 'params': [p for n, p in self.model.named_parameters() 
                           if not any(nd in n for nd in no_decay)],
-                'weight_decay': 0.01,
+                'weight_decay': self.weight_decay,
                 'lr': self.learning_rate
             },
             {
@@ -94,6 +213,18 @@ class LLADAPretrainedTrainer:
         ]
         
         return torch.optim.AdamW(optimizer_grouped_parameters, lr=self.learning_rate)
+    
+    def _create_scheduler(self, num_training_steps: int = 1000):
+        """Create learning rate scheduler with warmup."""
+        if self.scheduler is not None:
+            return self.scheduler
+        
+        # Use linear warmup and cosine decay
+        return get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=self.warmup_steps,
+            num_training_steps=num_training_steps
+        )
         
     def forward_process(self, input_ids, eps=1e-3):
         """LLaDA forward process as described in GUIDELINES.md."""
@@ -156,25 +287,29 @@ class LLADAPretrainedTrainer:
         
         # Handle NaN in loss
         if torch.isnan(loss):
-            print("Warning: NaN loss detected, using fallback")
+            self.logger.warning("NaN loss detected, using fallback")
             loss = torch.tensor(10.0, device=input_ids.device, requires_grad=True)
         
         return loss
     
     def train_epoch(self, train_loader, epoch: int):
-        """Train for one epoch."""
+        """Train for one epoch with full Accelerate integration."""
         self.model.train()
         total_loss = 0
         num_batches = len(train_loader)
         
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        # Create progress bar only on main process
+        if self.accelerator.is_main_process:
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        else:
+            progress_bar = train_loader
         
         for batch_idx, batch in enumerate(progress_bar):
             input_ids = batch[0]
             
             # Check input for NaN
             if torch.isnan(input_ids).any():
-                print(f"Warning: NaN detected in input_ids at batch {batch_idx}")
+                self.logger.warning(f"NaN detected in input_ids at batch {batch_idx}")
                 continue
             
             # Apply LLaDA forward process
@@ -182,7 +317,7 @@ class LLADAPretrainedTrainer:
             
             # Check forward process outputs
             if torch.isnan(noisy_batch).any() or torch.isnan(p_mask).any():
-                print(f"Warning: NaN detected in forward process at batch {batch_idx}")
+                self.logger.warning(f"NaN detected in forward process at batch {batch_idx}")
                 continue
             
             # Compute loss
@@ -190,86 +325,65 @@ class LLADAPretrainedTrainer:
             
             # Check loss for NaN
             if torch.isnan(loss):
-                print(f"Warning: NaN loss detected at batch {batch_idx}")
+                self.logger.warning(f"NaN loss detected at batch {batch_idx}")
                 continue
+            
+            # Scale loss for gradient accumulation
+            loss = loss / self.gradient_accumulation_steps
             
             # Backward pass with accelerator
             self.accelerator.backward(loss)
             
-            # Enhanced gradient clipping with NaN detection
-            # Use accelerator's unwrapped model for gradient clipping
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            # Gradient clipping with proper unwrapping
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
             
-            # Debug: Check gradient statistics before clipping
-            total_params = 0
-            total_grads = 0
-            nan_grads = 0
-            inf_grads = 0
-            
-            for param in unwrapped_model.parameters():
-                if param.grad is not None:
-                    total_params += 1
-                    total_grads += param.grad.numel()
-                    nan_grads += torch.isnan(param.grad).sum().item()
-                    inf_grads += torch.isinf(param.grad).sum().item()
-            
-            if total_params > 0:
-                print(f"Debug: {total_params} params, {total_grads} gradients, {nan_grads} NaN, {inf_grads} Inf")
-            
-            # Only clip if we have valid gradients
-            if total_grads > 0 and nan_grads == 0 and inf_grads == 0:
-                try:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(unwrapped_model.parameters(), max_norm=1.0)
-                    print(f"Debug: Gradient norm after clipping: {grad_norm:.6f}")
-                    
-                    # Check for NaN gradients after clipping
-                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                        print(f"Warning: Invalid gradient norm detected after clipping: {grad_norm}")
-                        # Skip this update
-                        continue
-                except Exception as e:
-                    print(f"Warning: Error during gradient clipping: {e}")
-                    # Skip this update
-                    continue
-            else:
-                print(f"Warning: Skipping gradient clipping due to {nan_grads} NaN and {inf_grads} Inf gradients")
-                # Skip this update
-                continue
-            
-            # Optimizer step
-            self.optimizer.step()
-            
-            # Check model weights for NaN after update
-            has_nan_weights = False
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
-            for param in unwrapped_model.parameters():
-                if torch.isnan(param).any():
-                    has_nan_weights = True
-                    break
-            
-            if has_nan_weights:
-                print(f"Warning: NaN weights detected after update, stopping training")
-                return float('inf')  # Return high loss to indicate failure
-            
-            # Step scheduler for OneCycleLR (step after each batch)
-            self.scheduler.step()
+            # Optimizer step (only when we have accumulated enough gradients)
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+                self.global_step += 1
+                
+                # Log training metrics
+                if self.global_step % self.logging_steps == 0:
+                    self._log_training_metrics(loss.item(), epoch, batch_idx)
             
             total_loss += loss.item()
             
-            # Update progress bar
-            progress_bar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg_loss': f'{total_loss / (batch_idx + 1):.4f}',
-                'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
-            })
+            # Update progress bar on main process
+            if self.accelerator.is_main_process:
+                progress_bar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'avg_loss': f'{total_loss / (batch_idx + 1):.4f}',
+                    'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}',
+                    'step': self.global_step
+                })
         
         avg_loss = total_loss / num_batches
         self.train_losses.append(avg_loss)
         
         return avg_loss
     
+    def _log_training_metrics(self, loss, epoch, batch_idx):
+        """Log training metrics using accelerator's logging capabilities."""
+        if self.accelerator.is_main_process:
+            # Log to tensorboard via accelerator
+            self.accelerator.log({
+                "train/loss": loss,
+                "train/learning_rate": self.optimizer.param_groups[0]["lr"],
+                "train/epoch": epoch,
+                "train/global_step": self.global_step,
+            }, step=self.global_step)
+            
+            # Also log to console
+            self.logger.info(
+                f"Step {self.global_step}: loss = {loss:.4f}, "
+                f"lr = {self.optimizer.param_groups[0]['lr']:.6f}"
+            )
+    
     def validate(self, val_loader):
-        """Validate the model."""
+        """Validate the model with proper distributed evaluation."""
         self.model.eval()
         total_loss = 0
         num_batches = len(val_loader)
@@ -285,44 +399,68 @@ class LLADAPretrainedTrainer:
                 loss = self.compute_loss(input_ids, noisy_batch, masked_indices, p_mask)
                 total_loss += loss.item()
         
+        # Gather losses from all processes for proper averaging
         avg_loss = total_loss / num_batches
-        self.val_losses.append(avg_loss)
+        gathered_losses = self.accelerator.gather(torch.tensor(avg_loss))
         
-        return avg_loss
+        if self.accelerator.is_main_process:
+            # Average across all processes
+            final_loss = gathered_losses.mean().item()
+            self.val_losses.append(final_loss)
+            
+            # Log validation metrics
+            self.accelerator.log({
+                "eval/loss": final_loss,
+                "eval/global_step": self.global_step,
+            }, step=self.global_step)
+            
+            return final_loss
+        else:
+            return avg_loss
     
-    def save_checkpoint(self, epoch: int, save_dir: str):
-        """Save model checkpoint."""
+    def save_checkpoint(self, epoch: int, save_dir: str, is_best: bool = False):
+        """Save model checkpoint using accelerator."""
+        if not self.accelerator.is_main_process:
+            return
+            
         save_dir = Path(save_dir)
         save_dir.mkdir(exist_ok=True)
         
         # Save model state using accelerator
-        checkpoint_path = save_dir / f"checkpoint_epoch_{epoch}"
+        if is_best:
+            checkpoint_path = save_dir / "best_model"
+        else:
+            checkpoint_path = save_dir / f"checkpoint_epoch_{epoch}"
+        
         self.accelerator.save_state(checkpoint_path)
         
         # Save training stats separately
         stats_path = save_dir / f"stats_epoch_{epoch}.json"
         stats = {
             'epoch': epoch,
+            'global_step': self.global_step,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'vocab_size': self.vocab_size,
-            'mask_token': self.mask_token
+            'mask_token': self.mask_token,
+            'best_val_loss': self.best_val_loss,
+            'learning_rate': self.learning_rate,
+            'weight_decay': self.weight_decay
         }
         with open(stats_path, 'w') as f:
             json.dump(stats, f, indent=2)
         
-        print(f"Checkpoint saved to {checkpoint_path}")
+        self.logger.info(f"Checkpoint saved to {checkpoint_path}")
     
     def train(self, train_loader, val_loader, num_epochs: int, save_dir: str = "checkpoints"):
-        """Main training loop."""
-        print(f"Starting training for {num_epochs} epochs...")
-        print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        """Main training loop with full Accelerate integration."""
+        self.logger.info(f"Starting training for {num_epochs} epochs...")
+        self.logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
         # Update scheduler total steps
-        total_steps = len(train_loader) * num_epochs
-        self.scheduler.total_steps = total_steps
-        
-        best_val_loss = float('inf')
+        total_steps = len(train_loader) * num_epochs // self.gradient_accumulation_steps
+        if hasattr(self.scheduler, 'num_training_steps'):
+            self.scheduler.num_training_steps = total_steps
         
         for epoch in range(1, num_epochs + 1):
             start_time = time.time()
@@ -330,32 +468,38 @@ class LLADAPretrainedTrainer:
             # Training
             train_loss = self.train_epoch(train_loader, epoch)
             
-            # Check if training failed
-            if train_loss == float('inf'):
-                print(f"Training failed at epoch {epoch}, stopping...")
-                break
-            
             # Validation
             val_loss = self.validate(val_loader)
             
             epoch_time = time.time() - start_time
             
-            print(f"\nEpoch {epoch}/{num_epochs} completed in {epoch_time:.2f}s")
-            print(f"Train Loss: {train_loss:.4f}")
-            print(f"Val Loss: {val_loss:.4f}")
-            print(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
-            
-            # Save best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.save_checkpoint(epoch, save_dir)
-            
-            # Save checkpoint every 5 epochs
-            if epoch % 5 == 0:
-                self.save_checkpoint(epoch, save_dir)
+            if self.accelerator.is_main_process:
+                self.logger.info(f"\nEpoch {epoch}/{num_epochs} completed in {epoch_time:.2f}s")
+                self.logger.info(f"Train Loss: {train_loss:.4f}")
+                self.logger.info(f"Val Loss: {val_loss:.4f}")
+                self.logger.info(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
+                self.logger.info(f"Global Step: {self.global_step}")
+                
+                # Save best model
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    self.save_checkpoint(epoch, save_dir, is_best=True)
+                
+                # Save checkpoint every save_steps
+                if epoch % 5 == 0:
+                    self.save_checkpoint(epoch, save_dir)
         
-        print(f"\nTraining completed!")
-        print(f"Best validation loss: {best_val_loss:.4f}")
+        if self.accelerator.is_main_process:
+            self.logger.info(f"\nTraining completed!")
+            self.logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
+            
+            # Save final checkpoint
+            self.save_checkpoint(num_epochs, save_dir)
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model checkpoint using accelerator."""
+        self.accelerator.load_state(checkpoint_path)
+        self.logger.info(f"Checkpoint loaded from {checkpoint_path}")
 
 
 def load_pretrained_model(model_name: str = 'GSAI-ML/LLaDA-8B-Instruct'):
@@ -402,8 +546,8 @@ def load_dataset(data_dir: str):
     return train_data, val_data, metadata
 
 
-def create_data_loaders(train_data, val_data, batch_size: int):
-    """Create PyTorch data loaders."""
+def create_data_loaders(train_data, val_data, batch_size: int, num_workers: int = 4):
+    """Create PyTorch data loaders with Accelerate integration."""
     # Convert to tensors
     train_tensor = torch.tensor(train_data, dtype=torch.long)
     val_tensor = torch.tensor(val_data, dtype=torch.long)
@@ -412,84 +556,166 @@ def create_data_loaders(train_data, val_data, batch_size: int):
     train_dataset = TensorDataset(train_tensor)
     val_dataset = TensorDataset(val_tensor)
     
-    # Create data loaders
+    # Create data loaders with proper distributed settings
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True,
-        num_workers=0  # Set to higher value for multi-GPU training
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True  # Important for distributed training
     )
     
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False,
-        num_workers=0
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False
     )
     
     return train_loader, val_loader
 
 
 def main():
-    """Main function."""
-    parser = argparse.ArgumentParser(description="Fine-tune pre-trained LLaDA on Shakespeare dataset")
+    """Main function with full Accelerate integration."""
+    parser = argparse.ArgumentParser(description="Fine-tune pre-trained LLaDA on Shakespeare dataset with Accelerate")
     parser.add_argument("--data_dir", type=str, required=True,
                        help="Directory containing processed dataset")
     parser.add_argument("--model_name", type=str, default="GSAI-ML/LLaDA-8B-Instruct",
                        help="Pre-trained model name from Hugging Face")
     parser.add_argument("--batch_size", type=int, default=1,
-                       help="Training batch size (default: 1 for large models)")
+                       help="Training batch size per device (default: 1 for large models)")
     parser.add_argument("--epochs", type=int, default=5,
                        help="Number of training epochs (default: 5 for fine-tuning)")
     parser.add_argument("--learning_rate", type=float, default=1e-5,
                        help="Learning rate (default: 1e-5 for fine-tuning)")
-    parser.add_argument("--device", type=str, default="auto",
-                       help="Device to use (auto, cpu, cuda)")
+    parser.add_argument("--weight_decay", type=float, default=0.01,
+                       help="Weight decay (default: 0.01)")
+    parser.add_argument("--warmup_steps", type=int, default=100,
+                       help="Number of warmup steps (default: 100)")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                       help="Maximum gradient norm for clipping (default: 1.0)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                       help="Number of steps to accumulate gradients (default: 1)")
+    parser.add_argument("--dataloader_num_workers", type=int, default=4,
+                       help="Number of dataloader workers (default: 4)")
+    parser.add_argument("--logging_steps", type=int, default=10,
+                       help="Log every X steps (default: 10)")
+    parser.add_argument("--save_steps", type=int, default=500,
+                       help="Save checkpoint every X steps (default: 500)")
+    parser.add_argument("--eval_steps", type=int, default=500,
+                       help="Evaluate every X steps (default: 500)")
     parser.add_argument("--save_dir", type=str, default="checkpoints_pretrained",
                        help="Directory to save checkpoints")
     parser.add_argument("--fp16", action="store_true",
                        help="Enable 16-bit mixed precision training")
+    parser.add_argument("--bf16", action="store_true",
+                       help="Enable BFloat16 mixed precision training")
     parser.add_argument("--no_fp16", action="store_true",
-                       help="Disable 16-bit mixed precision training")
+                       help="Disable mixed precision training")
+    parser.add_argument("--seed", type=int, default=42,
+                       help="Random seed (default: 42)")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                       help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
     
-    # Set device
-    if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        device = args.device
+    # Create configuration object
+    config = TrainingConfig(
+        data_dir=args.data_dir,
+        model_name=args.model_name,
+        batch_size=args.batch_size,
+        num_epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        warmup_steps=args.warmup_steps,
+        max_grad_norm=args.max_grad_norm,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        dataloader_num_workers=args.dataloader_num_workers,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        eval_steps=args.eval_steps,
+        save_dir=args.save_dir,
+        seed=args.seed,
+        resume_from_checkpoint=args.resume_from_checkpoint
+    )
     
-    print(f"Using device: {device}")
+    # Determine mixed precision setting
+    if args.bf16:
+        config.mixed_precision = 'bf16'
+    elif args.fp16 and not args.no_fp16:
+        config.mixed_precision = 'fp16'
+    else:
+        config.mixed_precision = 'no'
+    
+    # Set seed for reproducibility
+    set_seed(config.seed)
+    
+    # Setup logging
+    setup_accelerate_logging()
+    
+    print(f"Training configuration:")
+    print(f"  - Mixed precision: {config.mixed_precision}")
+    print(f"  - Batch size per device: {config.batch_size}")
+    print(f"  - Gradient accumulation steps: {config.gradient_accumulation_steps}")
+    print(f"  - Effective batch size: {config.effective_batch_size}")
+    print(f"  - Learning rate: {config.learning_rate}")
+    print(f"  - Weight decay: {config.weight_decay}")
+    print(f"  - Warmup steps: {config.warmup_steps}")
+    print(f"  - Max gradient norm: {config.max_grad_norm}")
+    print(f"  - Number of epochs: {config.num_epochs}")
     
     # Load pre-trained model
-    model, tokenizer = load_pretrained_model(args.model_name)
+    model, tokenizer = load_pretrained_model(config.model_name)
     
     # Load dataset
-    train_data, val_data, metadata = load_dataset(args.data_dir)
+    train_data, val_data, metadata = load_dataset(config.data_dir)
+    
+    # Update config with dataset metadata
+    config.mask_token = metadata.get('mask_token', 126336)
     
     # Create data loaders
-    train_loader, val_loader = create_data_loaders(train_data, val_data, args.batch_size)
+    train_loader, val_loader = create_data_loaders(
+        train_data, val_data, config.batch_size, config.dataloader_num_workers
+    )
     
-    # Create trainer
-    mixed_precision = 'fp16' if device == "cuda" and not args.no_fp16 else 'no'
+    # Create trainer with full Accelerate integration
     trainer = LLADAPretrainedTrainer(
         model=model,
         tokenizer=tokenizer,
-        mask_token=metadata['mask_token'],
-        learning_rate=args.learning_rate,
-        mixed_precision=mixed_precision
+        mask_token=config.mask_token,
+        learning_rate=config.learning_rate,
+        mixed_precision=config.mixed_precision,
+        weight_decay=config.weight_decay,
+        warmup_steps=config.warmup_steps,
+        max_grad_norm=config.max_grad_norm,
+        logging_steps=config.logging_steps,
+        save_steps=config.save_steps,
+        eval_steps=config.eval_steps,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        dataloader_num_workers=config.dataloader_num_workers
     )
+    
+    # Resume from checkpoint if specified
+    if config.resume_from_checkpoint:
+        trainer.load_checkpoint(config.resume_from_checkpoint)
+        print(f"Resumed training from checkpoint: {config.resume_from_checkpoint}")
     
     # Prepare data loaders with accelerator
     train_loader, val_loader = trainer.accelerator.prepare(train_loader, val_loader)
+    
+    # Log configuration
+    if trainer.accelerator.is_main_process:
+        trainer.accelerator.log(config.to_dict(), step=0)
     
     # Train model
     trainer.train(
         train_loader=train_loader,
         val_loader=val_loader,
-        num_epochs=args.epochs,
-        save_dir=args.save_dir
+        num_epochs=config.num_epochs,
+        save_dir=config.save_dir
     )
 
 
