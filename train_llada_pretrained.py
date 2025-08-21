@@ -40,10 +40,11 @@ def cleanup_ddp():
 class LLADAPretrainedTrainer:
     """LLaDA trainer for pre-trained models implementing the training process from GUIDELINES.md."""
     
-    def __init__(self, model, tokenizer, rank, world_size, mask_token: int = 126336, 
+    def __init__(self, model, tokenizer, rank, world_size, device, mask_token: int = 126336, 
                  learning_rate: float = 1e-5, mixed_precision: bool = True):
         self.tokenizer = tokenizer
         self.mask_token = mask_token
+        self.device = device
         self.learning_rate = learning_rate
         self.rank = rank
         self.world_size = world_size
@@ -119,15 +120,16 @@ class LLADAPretrainedTrainer:
         # Create mask
         masked_indices = torch.rand((b, l), device=input_ids.device) < p_mask
         
-        # Apply masking
-        noisy_batch = torch.where(masked_indices, self.mask_token, input_ids)
+        # Apply masking - ensure mask_token is on the same device as input_ids
+        mask_token_tensor = torch.tensor(self.mask_token, device=input_ids.device, dtype=input_ids.dtype)
+        noisy_batch = torch.where(masked_indices, mask_token_tensor, input_ids)
         
         return noisy_batch, masked_indices, p_mask
     
     def compute_loss(self, input_ids, noisy_batch, masked_indices, p_mask):
         """Compute LLaDA loss as described in GUIDELINES.md."""
-        # Forward pass through the model
-        outputs = self.model(inputs_embeds=noisy_batch)
+        # Forward pass through the model - use input_ids since noisy_batch contains token IDs
+        outputs = self.model(input_ids=noisy_batch)
         logits = outputs.logits if hasattr(outputs, 'logits') else outputs.last_hidden_state
         
         # Ensure logits have the right shape for loss computation
@@ -450,11 +452,11 @@ def load_dataset(data_dir: str):
     return train_data, val_data, metadata
 
 
-def create_data_loaders(train_data, val_data, batch_size: int, rank: int, world_size: int):
+def create_data_loaders(train_data, val_data, batch_size: int, rank: int, world_size: int, device):
     """Create PyTorch data loaders with distributed sampling."""
-    # Convert to tensors
-    train_tensor = torch.tensor(train_data, dtype=torch.long)
-    val_tensor = torch.tensor(val_data, dtype=torch.long)
+    # Convert to tensors and move to device
+    train_tensor = torch.tensor(train_data, dtype=torch.long, device=device)
+    val_tensor = torch.tensor(val_data, dtype=torch.long, device=device)
     
     # Create datasets
     train_dataset = TensorDataset(train_tensor)
@@ -469,16 +471,16 @@ def create_data_loaders(train_data, val_data, batch_size: int, rank: int, world_
         train_dataset, 
         batch_size=batch_size, 
         sampler=train_sampler,
-        num_workers=4,  # Higher value for multi-GPU training
-        pin_memory=True
+        num_workers=0,  # Set to 0 for multi-GPU to avoid device issues
+        pin_memory=False  # Set to False since data is already on device
     )
     
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         sampler=val_sampler,
-        num_workers=4,
-        pin_memory=True
+        num_workers=0,
+        pin_memory=False
     )
     
     return train_loader, val_loader, train_sampler, val_sampler
@@ -506,7 +508,7 @@ def main_worker(rank, world_size, args):
     
     # Create data loaders
     train_loader, val_loader, train_sampler, val_sampler = create_data_loaders(
-        train_data, val_data, args.batch_size, rank, world_size
+        train_data, val_data, args.batch_size, rank, world_size, device
     )
     
     # Create trainer
@@ -515,6 +517,7 @@ def main_worker(rank, world_size, args):
         tokenizer=tokenizer,
         rank=rank,
         world_size=world_size,
+        device=device,
         mask_token=metadata['mask_token'],
         learning_rate=args.learning_rate,
         mixed_precision=args.fp16
